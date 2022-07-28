@@ -21,7 +21,35 @@
 #include "image_diff_png.hh"
 
 namespace {
+	std::string WstrToUtf8Str(const std::wstring& wstr)
+	{
+		std::string retStr;
+		if (!wstr.empty())
+		{
+			int sizeRequired = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, NULL, 0, NULL, NULL);
 
+			if (sizeRequired > 0)
+			{
+				std::vector<char> utf8String(sizeRequired);
+				int bytesConverted = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(),
+					-1, &utf8String[0], utf8String.size(), NULL,
+					NULL);
+				if (bytesConverted != 0)
+				{
+					retStr = &utf8String[0];
+				}
+				else
+				{
+					std::stringstream err;
+					err << __FUNCTION__
+						<< " std::string WstrToUtf8Str failed to convert wstring '"
+						<< wstr.c_str() << L"'";
+					throw std::runtime_error(err.str());
+				}
+			}
+		}
+		return retStr;
+	}
 void ExampleUnsupportedHandler(UNSUPPORT_INFO*, int type) {
   std::string feature = "Unknown";
   switch (type) {
@@ -248,6 +276,50 @@ void renderPdfToPNG(
     oData[i++] = *it;
   }
 }
+void renderPdfToRAW(
+	FPDF_PAGE iPage,
+	const char* iData,
+	const int iPageNum,
+	const int iStride,
+	const int iWidth,
+	const int iHeight,
+	std::string oError,
+	std::string& oData) {
+	if (iStride < 0 || iWidth < 0 || iHeight < 0) {
+		return;
+	}
+
+	if (iHeight > 0 && iWidth > INT_MAX / iHeight) {
+		return;
+	}
+
+	int out_len = iStride * iHeight;
+	if (out_len > INT_MAX / 3) {
+		return;
+	}
+
+
+	char* result = new char[out_len];
+	if (result) {
+		for (int h = 0; h < iHeight; ++h) {
+			const char* src_line = iData + (iStride * h);
+			char* dest_line = result + (iWidth * h * 4);
+			for (int w = 0; w < iWidth; ++w) {
+				// R
+				dest_line[w * 4] = src_line[(w * 4) + 2];
+				// G
+				dest_line[(w * 4) + 1] = src_line[(w * 4) + 1];
+				// B
+				dest_line[(w * 4) + 2] = src_line[w * 4];
+				// A
+				dest_line[(w * 4) + 3] = src_line[w * 4 + 3];
+			}
+		}
+
+		oData.append(result, out_len);
+		delete[] result;
+	}
+}
 
 void renderPdfToPPM(
     FPDF_PAGE iPage,
@@ -324,6 +396,7 @@ public:
 #endif  // _WIN32
     outputFormats.insert(std::make_pair("PNG", renderPdfToPNG));
     outputFormats.insert(std::make_pair("PPM", renderPdfToPPM));
+    outputFormats.insert(std::make_pair("RAW", renderPdfToRAW));
 
     uv_mutex_init(&PdfProcessingMutex);
   }
@@ -367,6 +440,10 @@ struct RenderAsyncReq {
   // output
   std::string error;
   std::vector<std::string> result;
+  std::vector<std::wstring> text;
+  std::vector<int> width;
+  std::vector<int> stride;
+  std::vector<int> height;
 
   // callback
   v8::Persistent<v8::Function> callback;
@@ -379,6 +456,7 @@ struct RenderAsyncReq {
 void RenderAsync(uv_work_t *r) {
   // TODO (ionlupascu@gmail.com): resolve raise condition and remove mutex:
   // node(34942,0x103c0a000) malloc: *** error for object 0x103906eb8: incorrect checksum for freed object - object was probably modified after being freed.
+    unsigned short *  textresult ;
   PdfModule::Lock processingLock;
   RenderAsyncReq* req = reinterpret_cast<RenderAsyncReq*>(r->data);
   PdfModule::RenderFormatsType::const_iterator renderRoutineCbIt = PdfModule::GetModule().getOutputFormats().find(req->outputFormat);
@@ -453,7 +531,15 @@ void RenderAsync(uv_work_t *r) {
   size_t rendered_pages = 0;
   size_t bad_pages = 0;
   req->result.clear();
+  req->text.clear();
+  req->height.clear();
+  req->width.clear();
+  req->stride.clear();
   req->result.resize(page_count);
+  req->text.resize(page_count);
+  req->height.resize(page_count);
+  req->width.resize(page_count);
+  req->stride.resize(page_count);
   for (int i = 0; i < page_count; ++i) {
     FPDF_PAGE page = FPDF_LoadPage(doc, i);
     if (!page) {
@@ -461,13 +547,21 @@ void RenderAsync(uv_work_t *r) {
         continue;
     }
     FPDF_TEXTPAGE text_page = FPDFText_LoadPage(page);
+
+    int text_count = FPDFText_CountChars ( text_page ) ;
+    int  out_text_count=0;
+	textresult = new unsigned short[text_count+20];
+    out_text_count=FPDFText_GetText  (    text_page,0,text_count,textresult);
+
+
+    req->text[i].append((wchar_t *)textresult,out_text_count);
+
     FORM_OnAfterLoadPage(page, form);
     FORM_DoPageAAction(page, form, FPDFPAGE_AACTION_OPEN);
 
     double scale = req->scaleFactor;
     int width = static_cast<int>(FPDF_GetPageWidth(page) * scale);
     int height = static_cast<int>(FPDF_GetPageHeight(page) * scale);
-
     FPDF_BITMAP bitmap = FPDFBitmap_Create(width, height, 0);
     FPDFBitmap_FillRect(bitmap, 0, 0, width, height, 0xFFFFFFFF);
     FPDF_RenderPageBitmap(bitmap, page, 0, 0, width, height, 0, 0);
@@ -475,6 +569,9 @@ void RenderAsync(uv_work_t *r) {
 
     FPDF_FFLDraw(form, bitmap, page, 0, 0, width, height, 0, 0);
     int stride = FPDFBitmap_GetStride(bitmap);
+	req->stride[i] = stride;
+	req->width[i] = width;
+	req->height[i] = height;
     const char* buffer =
         reinterpret_cast<const char*>(FPDFBitmap_GetBuffer(bitmap));
     renderRoutineCb(page, buffer, i, stride, width, height, req->error, req->result[i]);
@@ -500,16 +597,28 @@ void RenderAsync(uv_work_t *r) {
   //req->error = "Not implemented yet";
 }
 
-void EncodePagesResult(const std::vector<std::string>& iResult, v8::Handle<v8::Array> oResult) {
-  MY_NODE_MODULE_ISOLATE_DECL;
-  int i = 0;
-  for(std::vector<std::string>::const_iterator it = iResult.begin(); it != iResult.end(); ++it) {
-    v8::MaybeLocal<v8::Object> objTemp = node::Buffer::New(MY_NODE_MODULE_ISOLATE_PRE (char*)it->c_str(), it->size());
-	v8::Local<v8::Value> data(objTemp.ToLocalChecked());
-	
-    oResult->Set(i++, data);
-  }
+void EncodePagesResult(const std::vector<std::string>& iResult, const std::vector<std::wstring>& iResultText,
+	const std::vector<int>& iResultWidth, const std::vector<int>& iResultHeight,
+	const std::vector<int>& iResultStride, v8::Handle<v8::Array> oResult) {
+	MY_NODE_MODULE_ISOLATE_DECL;
+	int i = 0;
+
+	v8::Isolate* Isolate = v8::Isolate::GetCurrent();
+
+	for (std::vector<std::string>::const_iterator it = iResult.begin(); it != iResult.end(); ++it) {
+		v8::EscapableHandleScope HandleScope(Isolate);
+		//v8::Local<v8::Value> data = node::Buffer::New(MY_NODE_MODULE_ISOLATE_PRE it->c_str(), (int)it->size());
+		v8::Local<v8::Value> data = HandleScope.Escape(node::Buffer::Copy(Isolate, it->c_str(), it->size()).ToLocalChecked());
+		v8::Local<v8::Object> result = V8_VALUE_NEW_DEFAULT_V_0_11_10(Object);
+		result->Set(v8::String::NewFromUtf8(Isolate, "data"), data);
+		result->Set(v8::String::NewFromUtf8(Isolate, "width"), v8::Integer::New(Isolate, iResultWidth[i]));
+		result->Set(v8::String::NewFromUtf8(Isolate, "height"), v8::Integer::New(Isolate, iResultHeight[i]));
+		result->Set(v8::String::NewFromUtf8(Isolate, "stride"), v8::Integer::New(Isolate, iResultStride[i]));
+		result->Set(v8::String::NewFromUtf8(Isolate, "text"), v8::String::NewFromTwoByte(Isolate, (uint16_t* )iResultText[i].data()));
+		oResult->Set(i++, result);
+	}
 }
+
 
 void RenderAsyncAfter(uv_work_t *r) {
   MY_NODE_MODULE_HANDLESCOPE;
@@ -524,7 +633,7 @@ void RenderAsyncAfter(uv_work_t *r) {
     callback->Call(MY_NODE_MODULE_CONTEXT, 1, argv);
   } else {
     v8::Local<v8::Array> result = V8_VALUE_NEW_DEFAULT_V_0_11_10(Array);
-    EncodePagesResult(req->result, result);
+	EncodePagesResult(req->result, req->text, req->width, req->height, req->stride, result);
 
     v8::Handle<v8::Value> argv[2] = {
       v8::Null(MY_NODE_MODULE_ISOLATE),
@@ -579,8 +688,7 @@ MY_NODE_MODULE_CALLBACK(render)
 
   if(dataobject->IsObject() && dataobject->IsUint8Array())
   {
-    req->data.assign(static_cast<char*>(dataobject.As<v8::Uint16Array>()->Buffer()->GetContents().Data()),
-            dataobject.As<v8::Uint16Array>()->Length());
+    req->data.assign(node::Buffer::Data(dataobject), node::Buffer::Length(dataobject));
   }
   else
   {
@@ -610,7 +718,7 @@ MY_NODE_MODULE_CALLBACK(render)
       RETURN_EXCEPTION_STR(req->error.c_str());
     } else {
       v8::Local<v8::Array> result = V8_VALUE_NEW_DEFAULT_V_0_11_10(Array);
-      EncodePagesResult(req->result, result);
+      EncodePagesResult(req->result, req->text,req->width,req->height,req->stride, result);
       MY_NODE_MODULE_RETURN_VALUE(result);
     }
   }
